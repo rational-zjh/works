@@ -1,0 +1,880 @@
+#=
+运行方式：
+1。将整个julia脚本文件复制到AnyMath下的脚本编辑器
+2。运行脚本
+=#
+
+using Pkg
+# 检查并安装必要的包
+required_packages = ["Random", "DataFrames", "Statistics", "Plots", "Dates", "Distributions", "CSV"]
+for pkg in required_packages
+    if !(pkg in keys(Pkg.installed()))
+        println("安装包: $pkg")
+        Pkg.add(pkg)
+    end
+end
+
+using Random, Statistics, DataFrames, Dates, Distributions, Plots, CSV
+
+# ==================== Zipf分布模块 ====================
+module ZipfModule
+using Distributions
+export Zipf, sample
+
+struct Zipf
+    a::Float64
+    x::Vector{Int}
+    weights::Vector{Float64}
+    dist::DiscreteNonParametric{Int, Float64, Vector{Int}, Vector{Float64}}
+    
+    function Zipf(min::Int, max::Int)
+        a = 1.1
+        x = collect(min:max)
+        weights = x .^ (-a)
+        weights ./= sum(weights)
+        dist = DiscreteNonParametric(x, weights)
+        new(a, x, weights, dist)
+    end
+end
+
+function sample(z::Zipf)
+    return rand(z.dist)
+end
+
+end # module ZipfModule
+
+# ==================== 合同模块 ====================
+module ContractModule
+export Contract, introduce_self
+
+struct Contract
+    l::Float64
+    f::Float64
+    alfa::Float64
+    beita::Float64
+    
+    function Contract(l::Float64, alfa::Float64=0.3, beita::Float64=0.5)
+        f = l / 2
+        new(l, f, alfa, beita)
+    end
+end
+
+function introduce_self(c::Contract)
+    println("The contract conditions : ", c.l, " kWh, penalty: \$", c.f, 
+            ", alfa=", c.alfa, ", beita=", c.beita)
+end
+
+end # module ContractModule
+
+# ==================== 发电机模块 ====================
+module GeneratorModule
+export Generator, introduce_self
+
+struct Generator
+    ID::Int
+    l::Float64
+    bid::Float64
+    
+    function Generator(ID::Int, l, price_multiply=0.5)
+        bid = price_multiply * Float64(l)
+        new(ID, Float64(l), bid)
+    end
+end
+
+function introduce_self(g::Generator)
+    println("Generator ID: ", g.ID, ", l: ", g.l, " kWh, price: \$", g.bid)
+end
+
+end # module GeneratorModule
+
+# ==================== 代理模块 ====================
+module AgentModule
+using ..ZipfModule
+using ..ContractModule
+export Agent, introduce_self, set_contract, set_single_contract,
+       Fixed_cont_bid_on_contract, SCE_cont_bid_on_contract,
+       cliff_cont_bid_on_contract, Fixed_single_cont_bid_on_contract
+
+mutable struct Agent
+    ID::Int
+    q::Float64
+    c::Float64
+    p::Float64
+    bid_in_SCE::Bool
+    contract::Vector{Contract}
+    single_contract::Vector{Contract}
+    
+    # Fields for bids
+    Fixed_cont_bids::Vector{Union{Float64, Nothing}}
+    Fixed_cont_all_q::Vector{Float64}
+    Fixed_cont_l_of_selected_cont::Union{Float64, Nothing}
+    Fixed_cont_f_of_selected_cont::Union{Float64, Nothing}
+    
+    Cliff_cont_bids::Vector{Union{Float64, Nothing}}
+    Cliff_cont_all_q::Vector{Float64}
+    Cliff_cont_l_of_selected_cont::Union{Float64, Nothing}
+    Cliff_cont_f_of_selected_cont::Union{Float64, Nothing}
+    
+    Fixed_single_cont_bids::Vector{Union{Float64, Nothing}}
+    Fixed_single_cont_all_q::Vector{Float64}
+    Fixed_single_cont_l_of_selected_cont::Union{Float64, Nothing}
+    Fixed_single_cont_f_of_selected_cont::Union{Float64, Nothing}
+    
+    SCE_cont_l_of_selected_cont::Union{Float64, Nothing}
+    
+    function Agent(ID::Int, zipf_dist)
+        q = sample(zipf_dist) * 10
+        c = rand(0.2:0.01:1) * q
+        p = rand(0.7:0.01:1)
+        bid_in_SCE = c / q <= 0.5
+        
+        new(ID, q, c, p, bid_in_SCE,
+            Contract[], Contract[], # contract, single_contract will be set later
+            Union{Float64, Nothing}[], Float64[], nothing, nothing, # Fixed_cont
+            Union{Float64, Nothing}[], Float64[], nothing, nothing, # Cliff_cont
+            Union{Float64, Nothing}[], Float64[], nothing, nothing, # Fixed_single_cont
+            nothing) # SCE_cont
+    end
+end
+
+function introduce_self(ag::Agent)
+    println("Agent ID: ", ag.ID, ", c: \$", round(ag.c, digits=2), 
+            ", q: ", round(ag.q, digits=2), " kWh, p: ", round(ag.p, digits=2))
+end
+
+function set_contract(ag::Agent, contract::Vector{Contract})
+    ag.contract = contract
+end
+
+function set_single_contract(ag::Agent, single_contract::Vector{Contract})
+    ag.single_contract = single_contract
+end
+
+function Fixed_cont_bid_on_contract(ag::Agent)
+    ag.Fixed_cont_bids = Union{Float64, Nothing}[]
+    ag.Fixed_cont_all_q = Float64[]
+    
+    for cont in ag.contract
+        if ag.q >= cont.l && ag.q < cont.l + 10
+            ag.Fixed_cont_l_of_selected_cont = cont.l
+            ag.Fixed_cont_f_of_selected_cont = cont.f
+            Fixed_cont_Bid = (1 - ag.p) * cont.f + ag.c
+            push!(ag.Fixed_cont_bids, Fixed_cont_Bid)
+            push!(ag.Fixed_cont_all_q, ag.q)
+            return
+        end
+    end
+    
+    # If no contract found, use highest contract
+    if length(ag.contract) > 0
+        Fixed_cont_highest_contract = ag.contract[end]
+        ag.Fixed_cont_l_of_selected_cont = Fixed_cont_highest_contract.l
+        ag.Fixed_cont_f_of_selected_cont = Fixed_cont_highest_contract.f
+        Fixed_cont_Bid = (1 - ag.p) * Fixed_cont_highest_contract.f + ag.c
+        
+        push!(ag.Fixed_cont_bids, Fixed_cont_Bid)
+        push!(ag.Fixed_cont_all_q, ag.q)
+    end
+end
+
+function SCE_cont_bid_on_contract(ag::Agent)
+    for cont in ag.contract
+        if ag.q >= cont.l && ag.q < cont.l + 10
+            ag.SCE_cont_l_of_selected_cont = cont.l
+            return
+        end
+    end
+    if length(ag.contract) > 0
+        SCE_cont_highest_contract = ag.contract[end]
+        ag.SCE_cont_l_of_selected_cont = SCE_cont_highest_contract.l
+    end
+end
+
+function cliff_cont_bid_on_contract(ag::Agent)
+    ag.Cliff_cont_bids = Union{Float64, Nothing}[]
+    ag.Cliff_cont_all_q = Float64[]
+    
+    for cont in ag.contract
+        if ag.q >= cont.l && ag.q < cont.l + 10
+            ag.Cliff_cont_l_of_selected_cont = cont.l
+            ag.Cliff_cont_f_of_selected_cont = cont.f
+            Cliff_cont_Bid = (1 - ag.p) * cont.f + ag.c
+            
+            if Cliff_cont_Bid <= cont.l / 2
+                push!(ag.Cliff_cont_bids, Cliff_cont_Bid)
+                push!(ag.Cliff_cont_all_q, ag.q)
+                return
+            else
+                push!(ag.Cliff_cont_bids, nothing)
+                return
+            end
+        end
+    end
+    
+    # If no contract found, use highest contract
+    if length(ag.contract) > 0
+        Cliff_cont_highest_contract = ag.contract[end]
+        ag.Cliff_cont_l_of_selected_cont = Cliff_cont_highest_contract.l
+        ag.Cliff_cont_f_of_selected_cont = Cliff_cont_highest_contract.f
+        Cliff_cont_Bid = (1 - ag.p) * Cliff_cont_highest_contract.f + ag.c
+        
+        if Cliff_cont_Bid <= Cliff_cont_highest_contract.l / 2
+            push!(ag.Cliff_cont_bids, Cliff_cont_Bid)
+            push!(ag.Cliff_cont_all_q, ag.q)
+        else
+            push!(ag.Cliff_cont_bids, nothing)
+        end
+    end
+end
+
+function Fixed_single_cont_bid_on_contract(ag::Agent)
+    ag.Fixed_single_cont_bids = Union{Float64, Nothing}[]
+    ag.Fixed_single_cont_all_q = Float64[]
+    
+    for cont in ag.single_contract
+        if ag.q >= cont.l
+            ag.Fixed_single_cont_l_of_selected_cont = cont.l
+            ag.Fixed_single_cont_f_of_selected_cont = cont.f
+            Fixed_single_cont_Bid = (1 - ag.p) * cont.f + ag.c
+            push!(ag.Fixed_single_cont_bids, Fixed_single_cont_Bid)
+            push!(ag.Fixed_single_cont_all_q, ag.q)
+        else
+            push!(ag.Fixed_single_cont_bids, nothing)
+            return
+        end
+    end
+end
+
+end # module AgentModule
+
+# ==================== 电网模块 ====================
+module GridModule
+using ..AgentModule, ..ContractModule, ..GeneratorModule
+export Grid, introduce_self, set_contract, set_single_contract, set_agents,
+       send_contracts_to_agents, send_single_contracts_to_agents,
+       Fixed_cont_generator_bids, select_SCE_agents, SCE_Total_Expenses,
+       SCE_reliability, knapsack, round_w, Fixed_cont_pay_to_agents,
+       Fixed_cont_reliability, Cliff_cont_pay_to_agents_2,
+       Cliff_cont_reliability, Fixed_single_cont_pay_to_agents_2,
+       Fixed_single_cont_reliability
+
+mutable struct Grid
+    M::Float64
+    gama::Float64
+    contract::Vector{Contract}
+    single_contract::Vector{Contract}
+    agents::Vector{Agent}
+    generators::Vector{Generator}
+    
+    # Results storage
+    selected_SCE_agents::Vector{Agent}
+    Use_reserve_price::Float64
+    Use_reserve_wt::Float64
+    List_SCE_pay::Vector{Float64}
+    List_actually_SCE_reduce::Vector{Float64}
+    sum_of_list_SCE_pay::Float64
+    sum_List_actually_SCE_reduce::Float64
+    
+    Fixed_cont_optimal_set_after::Vector{Int}
+    Fixed_cont_Total_expense_sum::Float64
+    Fixed_cont_reliability_sum_q::Float64
+    
+    Cliff_cont_optimal_set_after::Vector{Int}
+    Cliff_cont_Total_expense_sum::Float64
+    Cliff_cont_reliability_sum_q::Float64
+    
+    Fixed_single_cont_optimal_set_after::Vector{Int}
+    Fixed_single_cont_Total_expense_sum::Float64
+    Fixed_single_cont_reliability_sum_q::Float64
+    
+    function Grid(M, gama)
+        M_float = Float64(M)
+        gama_float = Float64(gama)
+        println("The grid wants to reduce: ", M_float, " kWh")
+        println("The grid asks to reduce: ", M_float * gama_float, " kWh")
+        
+        new(M_float, gama_float,
+            Contract[], Contract[], Agent[], Generator[], # contract, single_contract, agents, generators
+            Agent[], 0.0, 0.0, Float64[], Float64[], 0.0, 0.0, # SCE fields
+            Int[], 0.0, 0.0, # Fixed_cont
+            Int[], 0.0, 0.0, # Cliff_cont
+            Int[], 0.0, 0.0) # Fixed_single_cont
+    end
+end
+
+function introduce_self(g::Grid)
+    println("The grid asks to reduce ", g.M * g.gama, " kWh")
+end
+
+function set_contract(g::Grid, contract::Vector{Contract})
+    g.contract = contract
+end
+
+function set_single_contract(g::Grid, single_contract::Vector{Contract})
+    g.single_contract = single_contract
+end
+
+function set_agents(g::Grid, agents::Vector{Agent})
+    g.agents = agents
+end
+
+function send_contracts_to_agents(g::Grid)
+    for ag in g.agents
+        AgentModule.set_contract(ag, g.contract)
+    end
+end
+
+function send_single_contracts_to_agents(g::Grid)
+    for ag in g.agents
+        AgentModule.set_single_contract(ag, g.single_contract)
+    end
+end
+
+function Fixed_cont_generator_bids(g::Grid, price_multiply=0.5)
+    generators = []
+    i = -1
+    
+    # 所有l值都改为Float64
+    for _ in 1:4
+        push!(generators, Generator(i, 5000.0, price_multiply))
+        i -= 1
+    end
+    for _ in 1:4
+        push!(generators, Generator(i, 1000.0, price_multiply))
+        i -= 1
+    end
+    for _ in 1:2
+        push!(generators, Generator(i, 500.0, price_multiply))
+        i -= 1
+    end
+    for _ in 1:4
+        push!(generators, Generator(i, 100.0, price_multiply))
+        i -= 1
+    end
+    for _ in 1:2
+        push!(generators, Generator(i, 50.0, price_multiply))
+        i -= 1
+    end
+    for _ in 1:5
+        push!(generators, Generator(i, 10.0, price_multiply))
+        i -= 1
+    end
+    
+    g.generators = generators
+end
+
+function select_SCE_agents(g::Grid)
+    g.selected_SCE_agents = Agent[]
+    m_SCE = 0.0
+    
+    for ag in g.agents
+        if m_SCE >= g.M * g.gama
+            break
+        end
+        
+        if ag.c / ag.q <= 0.5
+            push!(g.selected_SCE_agents, ag)
+            m_SCE += ag.q
+        end
+    end
+    
+    if m_SCE < g.M * g.gama
+        g.Use_reserve_price = (g.M * g.gama - m_SCE) * 0.5
+        g.Use_reserve_wt = g.M * g.gama - m_SCE
+    else
+        g.Use_reserve_price = 0.0
+        g.Use_reserve_wt = 0.0
+    end
+end
+
+function SCE_Total_Expenses(g::Grid)
+    g.List_SCE_pay = Float64[]
+    g.List_actually_SCE_reduce = Float64[]
+    
+    for ag in g.selected_SCE_agents
+        AgentModule.SCE_cont_bid_on_contract(ag)  # Ensure SCE cont is set
+        cont_l = ag.SCE_cont_l_of_selected_cont
+        SCE_cont_random_number = rand()
+        
+        if ag.p >= SCE_cont_random_number
+            if ag.q < 0.5 * cont_l
+                Agents_SCE_pay = 0.0
+                push!(g.List_SCE_pay, Agents_SCE_pay)
+            elseif ag.q <= 1.5 * cont_l && ag.q >= 0.5 * cont_l
+                Agents_SCE_pay = 0.5 * ag.q
+                push!(g.List_SCE_pay, Agents_SCE_pay)
+                push!(g.List_actually_SCE_reduce, ag.q)
+            elseif ag.q > 1.5 * cont_l
+                Agents_SCE_pay = 0.5 * 1.5 * ag.q
+                push!(g.List_SCE_pay, Agents_SCE_pay)
+                push!(g.List_actually_SCE_reduce, ag.q)
+            end
+        end
+    end
+    
+    g.sum_of_list_SCE_pay = sum(g.List_SCE_pay) + g.Use_reserve_price
+    g.sum_List_actually_SCE_reduce = sum(g.List_actually_SCE_reduce) + g.Use_reserve_wt
+end
+
+function SCE_reliability(g::Grid)
+    if g.sum_List_actually_SCE_reduce >= g.M
+        println("SCE- The grid met the demand")
+    else
+        println("SCE- The grid doesn't meet the demand")
+    end
+end
+
+function knapsack(g::Grid, agents=nothing; bids_type="Cliff_cont_bids")
+    if agents === nothing
+        agents = g.agents
+    end
+    
+    # Determine min contract
+    if bids_type in ["Fixed_cont", "Cliff_cont_bids"] && length(g.contract) > 0
+        min_cont = g.contract[1]
+        W = round_w(g, min_cont.l)
+    elseif bids_type == "Fixed_single_cont" && length(g.single_contract) > 0
+        single_cont = g.single_contract[1]
+        W = round_w(g, single_cont.l)
+    else
+        return 0.0, Int[]
+    end
+    
+    # Prepare values and weights
+    val = Float64[]
+    wt = Float64[]
+    Knapsack_agents_map = Dict{Int, Int}()
+    i = 0
+    
+    # Add agents' bids
+    for ag in agents
+        if bids_type == "Cliff_cont_bids" && !isnothing(ag.Cliff_cont_bids) && length(ag.Cliff_cont_bids) > 0 && !isnothing(ag.Cliff_cont_bids[1])
+            push!(val, ag.Cliff_cont_bids[1])
+            Knapsack_agents_map[i] = ag.ID
+            push!(wt, ag.Cliff_cont_l_of_selected_cont)
+            i += 1
+        elseif bids_type == "Fixed_cont" && !isnothing(ag.Fixed_cont_bids) && length(ag.Fixed_cont_bids) > 0 && !isnothing(ag.Fixed_cont_bids[1])
+            push!(val, ag.Fixed_cont_bids[1])
+            Knapsack_agents_map[i] = ag.ID
+            push!(wt, ag.Fixed_cont_l_of_selected_cont)
+            i += 1
+        elseif bids_type == "Fixed_single_cont" && !isnothing(ag.Fixed_single_cont_bids) && length(ag.Fixed_single_cont_bids) > 0 && !isnothing(ag.Fixed_single_cont_bids[1])
+            push!(val, ag.Fixed_single_cont_bids[1])
+            Knapsack_agents_map[i] = ag.ID
+            push!(wt, ag.Fixed_single_cont_l_of_selected_cont)
+            i += 1
+        end
+    end
+    
+    # Add generators' bids
+    for gen in g.generators
+        push!(val, gen.bid)
+        Knapsack_agents_map[i] = gen.ID
+        push!(wt, gen.l)
+        i += 1
+    end
+    
+    n = length(val)
+    if n == 0
+        return 0.0, Int[]
+    end
+    
+    # Knapsack DP table
+    K = [zeros(Float64, Int(W) ÷ 10 + 1) for _ in 1:(n+1)]
+    Used = [zeros(Bool, Int(W) ÷ 10 + 1) for _ in 1:(n+1)]
+    
+    # Initialize
+    for w in 1:length(K[1])
+        K[1][w] = Inf
+    end
+    
+    for i in 1:(n+1)
+        K[i][1] = 0.0
+    end
+    
+    # DP
+    for i in 2:(n+1)
+        for w in 2:length(K[1])
+            current_weight = (w-1) * 10
+            if wt[i-1] > current_weight
+                K[i][w] = K[i-1][w]
+            else
+                prev_w = Int(w - ceil(wt[i-1] / 10))
+                if prev_w < 1
+                    prev_w = 1
+                end
+                
+                if K[i][prev_w] + val[i-1] < K[i-1][w]
+                    if !Used[i][prev_w]
+                        K[i][w] = K[i][prev_w] + val[i-1]
+                        Used[i][w] = true
+                    else
+                        K[i][w] = K[i-1][w]
+                    end
+                else
+                    K[i][w] = K[i-1][w]
+                end
+            end
+        end
+    end
+    
+    # Backtrack
+    optimal_set_before = Int[]
+    w = length(K[1])
+    for i in (n+1):-1:2
+        if w == 1
+            break
+        end
+        if K[i][w] != K[i-1][w]
+            pushfirst!(optimal_set_before, i-2)
+            w -= Int(ceil(wt[i-1] / 10))
+            if w < 1
+                w = 1
+            end
+        end
+    end
+    
+    # Map back to IDs
+    optimal_set_after = Int[]
+    for row in optimal_set_before
+        if haskey(Knapsack_agents_map, row)
+            push!(optimal_set_after, Knapsack_agents_map[row])
+        end
+    end
+    
+    # Calculate sum of bids
+    sum_of_bids = 0.0
+    for id in optimal_set_after
+        if id >= 0
+            if bids_type == "Cliff_cont_bids"
+                sum_of_bids += g.agents[id].Cliff_cont_bids[1]
+            elseif bids_type == "Fixed_cont"
+                sum_of_bids += g.agents[id].Fixed_cont_bids[1]
+            elseif bids_type == "Fixed_single_cont"
+                sum_of_bids += g.agents[id].Fixed_single_cont_bids[1]
+            end
+        else
+            gen_idx = -id
+            if 1 <= gen_idx <= length(g.generators)
+                sum_of_bids += g.generators[gen_idx].bid
+            end
+        end
+    end
+    
+    # Store results
+    if bids_type == "Cliff_cont_bids"
+        g.Cliff_cont_optimal_set_after = optimal_set_after
+    elseif bids_type == "Fixed_cont"
+        g.Fixed_cont_optimal_set_after = optimal_set_after
+    elseif bids_type == "Fixed_single_cont"
+        g.Fixed_single_cont_optimal_set_after = optimal_set_after
+    end
+    
+    return sum_of_bids, optimal_set_after
+end
+
+function round_w(g::Grid, l::Float64)
+    if mod(g.M * g.gama, l) == 0
+        W = Int(g.M * g.gama)
+    else
+        W = Int(round((g.M * g.gama) / l) * l)
+    end
+    return W
+end
+
+function Fixed_cont_pay_to_agents(g::Grid, Fixed_cont_sum_of_bids::Float64)
+    g.Fixed_cont_Total_expense_sum = 0.0
+    
+    for id in g.Fixed_cont_optimal_set_after
+        if id >= 0 && 1 <= id <= length(g.agents)
+            # Create agents list without agent i
+            agents_without_i = [ag for ag in g.agents if ag.ID != id]
+            optimal_sum_without_i, _ = knapsack(g, agents_without_i, bids_type="Fixed_cont")
+            original_sum_without_i = Fixed_cont_sum_of_bids - g.agents[id].Fixed_cont_bids[1]
+            payment = optimal_sum_without_i - original_sum_without_i
+            g.Fixed_cont_Total_expense_sum += payment
+        elseif id < 0
+            gen_idx = -id
+            if 1 <= gen_idx <= length(g.generators)
+                payment = g.generators[gen_idx].bid
+                g.Fixed_cont_Total_expense_sum += payment
+            end
+        end
+    end
+end
+
+function Fixed_cont_reliability(g::Grid)
+    g.Fixed_cont_reliability_sum_q = 0.0
+    
+    for id in g.Fixed_cont_optimal_set_after
+        if id >= 0 && 1 <= id <= length(g.agents)
+            random_number = rand()
+            if g.agents[id].p >= random_number
+                g.Fixed_cont_reliability_sum_q += g.agents[id].q
+            else
+                # Agent pays the contract penalty
+                if !isnothing(g.agents[id].Fixed_cont_f_of_selected_cont)
+                    g.Fixed_cont_Total_expense_sum -= g.agents[id].Fixed_cont_f_of_selected_cont
+                end
+            end
+        elseif id < 0
+            gen_idx = -id
+            if 1 <= gen_idx <= length(g.generators)
+                g.Fixed_cont_reliability_sum_q += g.generators[gen_idx].l
+            end
+        end
+    end
+    
+    println("Fixed cont- The reliable sum of q in optimal set is: ", 
+            round(g.Fixed_cont_reliability_sum_q, digits=2), " kWh")
+    
+    if g.Fixed_cont_reliability_sum_q >= g.M
+        println("Fixed cont- The grid met the demand")
+        return true
+    else
+        println("Fixed cont- The grid doesn't meet the demand")
+        return false
+    end
+end
+
+function Cliff_cont_pay_to_agents_2(g::Grid, Cliff_cont_sum_of_bids::Float64)
+    g.Cliff_cont_Total_expense_sum = 0.0
+    
+    for id in g.Cliff_cont_optimal_set_after
+        if id >= 0 && 1 <= id <= length(g.agents)
+            agents_without_i = [ag for ag in g.agents if ag.ID != id]
+            optimal_sum_without_i, _ = knapsack(g, agents_without_i, bids_type="Cliff_cont_bids")
+            original_sum_without_i = Cliff_cont_sum_of_bids - g.agents[id].Cliff_cont_bids[1]
+            payment = optimal_sum_without_i - original_sum_without_i
+            g.Cliff_cont_Total_expense_sum += payment
+        elseif id < 0
+            gen_idx = -id
+            if 1 <= gen_idx <= length(g.generators)
+                payment = g.generators[gen_idx].bid
+                g.Cliff_cont_Total_expense_sum += payment
+            end
+        end
+    end
+end
+
+function Cliff_cont_reliability(g::Grid)
+    g.Cliff_cont_reliability_sum_q = 0.0
+    
+    for id in g.Cliff_cont_optimal_set_after
+        if id >= 0 && 1 <= id <= length(g.agents)
+            random_number = rand()
+            if g.agents[id].p >= random_number
+                g.Cliff_cont_reliability_sum_q += g.agents[id].q
+            else
+                if !isnothing(g.agents[id].Cliff_cont_f_of_selected_cont)
+                    g.Cliff_cont_Total_expense_sum -= g.agents[id].Cliff_cont_f_of_selected_cont
+                end
+            end
+        elseif id < 0
+            gen_idx = -id
+            if 1 <= gen_idx <= length(g.generators)
+                g.Cliff_cont_reliability_sum_q += g.generators[gen_idx].l
+            end
+        end
+    end
+    
+    println("Cliff cont- The reliable sum of q in optimal set is: ",
+            round(g.Cliff_cont_reliability_sum_q, digits=2), " kWh")
+    
+    if g.Cliff_cont_reliability_sum_q >= g.M
+        println("Cliff cont- The grid met the demand")
+        return true
+    else
+        println("Cliff cont- The grid doesn't meet the demand")
+        return false
+    end
+end
+
+function Fixed_single_cont_pay_to_agents_2(g::Grid, Fixed_single_cont_sum_of_bids::Float64)
+    g.Fixed_single_cont_Total_expense_sum = 0.0
+    
+    for id in g.Fixed_single_cont_optimal_set_after
+        if id >= 0 && 1 <= id <= length(g.agents)
+            agents_without_i = [ag for ag in g.agents if ag.ID != id]
+            optimal_sum_without_i, _ = knapsack(g, agents_without_i, bids_type="Fixed_single_cont")
+            original_sum_without_i = Fixed_single_cont_sum_of_bids - g.agents[id].Fixed_single_cont_bids[1]
+            payment = optimal_sum_without_i - original_sum_without_i
+            g.Fixed_single_cont_Total_expense_sum += payment
+        elseif id < 0
+            gen_idx = -id
+            if 1 <= gen_idx <= length(g.generators)
+                payment = g.generators[gen_idx].bid
+                g.Fixed_single_cont_Total_expense_sum += payment
+            end
+        end
+    end
+end
+
+function Fixed_single_cont_reliability(g::Grid)
+    g.Fixed_single_cont_reliability_sum_q = 0.0
+    
+    for id in g.Fixed_single_cont_optimal_set_after
+        if id >= 0 && 1 <= id <= length(g.agents)
+            random_number = rand()
+            if g.agents[id].p >= random_number
+                if !isnothing(g.agents[id].Fixed_single_cont_l_of_selected_cont)
+                    g.Fixed_single_cont_reliability_sum_q += g.agents[id].Fixed_single_cont_l_of_selected_cont
+                end
+            else
+                if !isnothing(g.agents[id].Fixed_single_cont_f_of_selected_cont)
+                    g.Fixed_single_cont_Total_expense_sum -= g.agents[id].Fixed_single_cont_f_of_selected_cont
+                end
+            end
+        elseif id < 0
+            gen_idx = -id
+            if 1 <= gen_idx <= length(g.generators)
+                g.Fixed_single_cont_reliability_sum_q += g.generators[gen_idx].l
+            end
+        end
+    end
+    
+    println("Fixed single cont- The reliable sum of q in optimal set is: ",
+            round(g.Fixed_single_cont_reliability_sum_q, digits=2), " kWh")
+    
+    if g.Fixed_single_cont_reliability_sum_q >= g.M
+        println("Fixed single cont- The grid met the demand")
+        return true
+    else
+        println("Fixed single cont- The grid doesn't meet the demand")
+        return false
+    end
+end
+
+end # module GridModule
+
+# ==================== 主程序 ====================
+function main()
+    # 设置相同随机种子
+    Random.seed!(123)
+    
+    M = 1000.0  # 改为Float64
+    number_of_agents = 200
+    number_of_simulation_per_lambda = 100  # 暂时减少到10次以便快速测试
+    generator_price_multiply = 1
+    gamma = [1.0, 1.166, 1.333, 1.5, 1.666, 1.833, 2]  # 暂时减少gamma值以便快速测试
+    
+    df_columns = ["actual expense", "gamma", "M", "actual kWh reduced", "Met the demand"]
+    row_data_df = DataFrame(actual_expense=Float64[], gamma=Float64[], M=Float64[], 
+                           actual_kWh_reduced=Float64[], Met_the_demand=Int[])
+    
+    Fixed_cont_avg_cost = Float64[]
+    Fixed_cont_avg_reliability = Float64[]
+    Fixed_single_cont_avg_cost = Float64[]
+    Fixed_single_cont_avg_reliability = Float64[]
+    T_F_List_Fixed_cont_Met_the_demand = Int[]
+    Fixed_cont_Total_expense = Float64[]
+    
+    zipf_dist = ZipfModule.Zipf(1, 500)
+    
+    for lb in gamma
+        Fixed_cont_reduce_list = Float64[]
+        local_expenses = Float64[]
+        local_met_demand = Int[]
+        
+        for sim in 1:number_of_simulation_per_lambda
+            println("Gamma: $lb, Simulation: $sim")
+            start_time = time()
+            
+            # Create grid - 传入Float64参数
+            Grid = GridModule.Grid(M, lb)
+            
+            # Create agents
+            Agents = [AgentModule.Agent(i, zipf_dist) for i in 1:number_of_agents]
+            
+            # Create contracts
+            Contracts = [ContractModule.Contract(Float64(i)) for i in 10:10:Int(M)]
+            single_contract = [ContractModule.Contract(50.0)]
+            
+            # Set up grid
+            GridModule.set_contract(Grid, Contracts)
+            GridModule.set_single_contract(Grid, single_contract)
+            GridModule.set_agents(Grid, Agents)
+            GridModule.send_contracts_to_agents(Grid)
+            GridModule.send_single_contracts_to_agents(Grid)
+            
+            # Get bids
+            for ag in Agents
+                AgentModule.Fixed_cont_bid_on_contract(ag)
+            end
+            
+            for ag in Agents
+                AgentModule.Fixed_single_cont_bid_on_contract(ag)
+            end
+            
+            # Set up generators - 使用位置参数而不是关键字参数
+            GridModule.Fixed_cont_generator_bids(Grid, generator_price_multiply)
+            
+            # Run knapsack and payments
+            Fixed_cont_sum_of_bids, optimal_set = GridModule.knapsack(Grid, bids_type="Fixed_cont")
+            GridModule.Fixed_cont_pay_to_agents(Grid, Fixed_cont_sum_of_bids)
+            met_demand = GridModule.Fixed_cont_reliability(Grid)
+            
+            # Store results
+            push!(local_expenses, Grid.Fixed_cont_Total_expense_sum)
+            push!(Fixed_cont_reduce_list, Grid.Fixed_cont_reliability_sum_q)
+            
+            met_demand_int = met_demand ? 1 : 0
+            push!(local_met_demand, met_demand_int)
+            
+            # Add to DataFrame
+            push!(row_data_df, 
+                  [Grid.Fixed_cont_Total_expense_sum, lb, M, 
+                   Grid.Fixed_cont_reliability_sum_q, met_demand_int])
+            
+            end_time = time()
+            println("Iteration took: ", round(end_time - start_time, digits=2), " seconds")
+            println("-"^100)
+        end
+        
+        # Calculate averages for this gamma
+        push!(Fixed_cont_avg_cost, mean(local_expenses))
+        push!(Fixed_cont_Total_expense, sum(local_expenses))
+        append!(T_F_List_Fixed_cont_Met_the_demand, local_met_demand)
+        
+        if length(local_met_demand) > 0
+            reliability_rate = count(x -> x == 1, local_met_demand) / length(local_met_demand)
+            push!(Fixed_cont_avg_reliability, reliability_rate)
+        else
+            push!(Fixed_cont_avg_reliability, 0.0)
+        end
+    end
+    
+    # Save results
+    filename = "./energy_demand_row_data-" * Dates.format(now(), "yyyy-mm-dd-HH-MM-SS") * ".csv"
+    CSV.write(filename, row_data_df)
+    
+    println("Fixed contract average reliability: ", Fixed_cont_avg_reliability)
+    println("Fixed contract average cost: ", Fixed_cont_avg_cost)
+    
+    # Plot results
+    graph_it(Fixed_cont_avg_reliability, Fixed_single_cont_avg_reliability,
+             Fixed_cont_avg_cost, Fixed_single_cont_avg_cost)
+end
+
+function graph_it(Fixed_cont_avg_reliability=[],
+                  Fixed_single_cont_avg_reliability=[],
+                  Fixed_cont_avg_cost=[],
+                  Fixed_single_cont_avg_cost=[])
+    
+    plt = plot(size=(800, 800), dpi=100)
+    
+    plot!(Fixed_cont_avg_reliability, Fixed_cont_avg_cost, 
+          color=:blue, marker=:o, label="fixed multiple cont",
+          xlabel="Total Reliability", ylabel="Expenses (\$)", 
+          title="(a) n = 200", legend=:topleft)
+    
+    if length(Fixed_single_cont_avg_reliability) > 0 && length(Fixed_single_cont_avg_cost) > 0
+        plot!(Fixed_single_cont_avg_reliability, Fixed_single_cont_avg_cost,
+              color=:black, marker=:o, label="fixed single cont")
+    end
+    
+    savefig("test.png")
+    display(plt)
+end
+
+main()
