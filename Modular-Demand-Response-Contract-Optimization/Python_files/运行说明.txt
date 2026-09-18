@@ -1,0 +1,3 @@
+1。下载anaconda3和PyCharm，及必要的第三方包。
+2。将本级目录下的6个.py文件复制到PyCharm下。
+3。运行main.py。
